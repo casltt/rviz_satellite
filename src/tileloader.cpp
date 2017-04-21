@@ -12,11 +12,17 @@
 
 #include <QUrl>
 #include <QNetworkRequest>
+#include <QNetworkProxy>
 #include <QVariant>
+#include <QDir>
+#include <QFile>
+#include <QImage>
 #include <QImageReader>
 #include <stdexcept>
-#include <iostream>
 #include <boost/regex.hpp>
+#include <ros/ros.h>
+#include <ros/package.h>
+#include <functional> // for std::hash
 
 static size_t replaceRegex(const boost::regex &ex, std::string &str,
                            const std::string &replace) {
@@ -45,45 +51,84 @@ TileLoader::TileLoader(const std::string &service, double latitude,
                        double longitude, unsigned int zoom, unsigned int blocks,
                        QObject *parent)
     : QObject(parent), latitude_(latitude), longitude_(longitude), zoom_(zoom),
-      blocks_(blocks), qnam_(0), object_uri_(service) {
+      blocks_(blocks), object_uri_(service) {
   assert(blocks_ >= 0);
+
+  const std::string package_path = ros::package::getPath("rviz_satellite");
+  if (package_path.empty()) {
+    throw std::runtime_error("package 'rviz_satellite' not found");
+  }
+
+  std::hash<std::string> hash_fn;
+  cache_path_ =
+      QDir::cleanPath(QString::fromStdString(package_path) + QDir::separator() +
+                      QString("mapscache") + QDir::separator() +
+                      QString::number(hash_fn(object_uri_)));
+
+  QDir dir(cache_path_);
+  if (!dir.exists() && !dir.mkpath(".")) {
+    throw std::runtime_error("Failed to create cache folder: " +
+                             cache_path_.toStdString());
+  }
+
   /// @todo: some kind of error checking of the URL
 
   //  calculate center tile coordinates
   double x, y;
   latLonToTileCoords(latitude_, longitude_, zoom_, x, y);
-  tile_x_ = std::floor(x);
-  tile_y_ = std::floor(y);
+  center_tile_x_ = std::floor(x);
+  center_tile_y_ = std::floor(y);
   //  fractional component
-  origin_x_ = x - tile_x_;
-  origin_y_ = y - tile_y_;
+  origin_offset_x_ = x - center_tile_x_;
+  origin_offset_y_ = y - center_tile_y_;
+}
+
+bool TileLoader::insideCentreTile(double lat, double lon) const {
+  double x, y;
+  latLonToTileCoords(lat, lon, zoom_, x, y);
+  return (std::floor(x) == center_tile_x_ && std::floor(y) == center_tile_y_);
 }
 
 void TileLoader::start() {
   //  discard previous set of tiles and all pending requests
   abort();
 
-  qnam_ = new QNetworkAccessManager(this);
-  QObject::connect(qnam_, SIGNAL(finished(QNetworkReply *)), this,
+  ROS_INFO("loading %d blocks around tile=(%d,%d)", blocks_, center_tile_x_, center_tile_y_ );
+
+  qnam_.reset( new QNetworkAccessManager(this) );
+  QObject::connect(qnam_.get(), SIGNAL(finished(QNetworkReply *)), this,
                    SLOT(finishedRequest(QNetworkReply *)));
+  qnam_->proxyFactory()->setUseSystemConfiguration ( true );
 
   //  determine what range of tiles we can load
-  const int min_x = std::max(0, tile_x_ - blocks_);
-  const int min_y = std::max(0, tile_y_ - blocks_);
-  const int max_x = std::min(maxTiles(), tile_x_ + blocks_);
-  const int max_y = std::min(maxTiles(), tile_y_ + blocks_);
+  const int min_x = std::max(0, center_tile_x_ - blocks_);
+  const int min_y = std::max(0, center_tile_y_ - blocks_);
+  const int max_x = std::min(maxTiles(), center_tile_x_ + blocks_);
+  const int max_y = std::min(maxTiles(), center_tile_y_ + blocks_);
 
   //  initiate requests
   for (int y = min_y; y <= max_y; y++) {
     for (int x = min_x; x <= max_x; x++) {
-      const QUrl uri = uriForTile(x, y);
-      //  send request
-      const QNetworkRequest request = QNetworkRequest(uri);
-      QNetworkReply *rep = qnam_->get(request);
-      emit initiatedRequest(request);
-      tiles_.push_back(MapTile(x, y, rep));
+      // Generate filename
+      const QString full_path = cachedPathForTile(x, y, zoom_);
+
+      // Check if tile is already in the cache
+      QFile tile(full_path);
+      if (tile.exists()) {
+        QImage image(full_path);
+        tiles_.push_back(MapTile(x, y, zoom_, image));
+      } else {
+        const QUrl uri = uriForTile(x, y);
+        //  send request
+        const QNetworkRequest request = QNetworkRequest(uri);
+        QNetworkReply *rep = qnam_->get(request);
+        emit initiatedRequest(request);
+        tiles_.push_back(MapTile(x, y, zoom_, rep));
+      }
     }
   }
+
+  checkIfLoadingComplete();
 }
 
 double TileLoader::resolution() const {
@@ -94,7 +139,7 @@ double TileLoader::resolution() const {
 /// For explanation of these calculations.
 void TileLoader::latLonToTileCoords(double lat, double lon, unsigned int zoom,
                                     double &x, double &y) {
-  if (zoom > 19) {
+  if (zoom > 31) {
     throw std::invalid_argument("Zoom level " + std::to_string(zoom) +
                                 " too high");
   } else if (lat < -85.0511 || lat > 85.0511) {
@@ -111,7 +156,7 @@ void TileLoader::latLonToTileCoords(double lat, double lon, unsigned int zoom,
   x = n * ((lon + 180) / 360.0);
   y = n * (1 - (std::log(std::tan(lat_rad) + 1 / std::cos(lat_rad)) / M_PI)) /
       2;
-  std::cout << "Center tile coords: " << x << ", " << y << std::endl;
+  ROS_DEBUG_STREAM( "Center tile coords: " << x << ", " << y );
 }
 
 double TileLoader::zoomToResolution(double lat, unsigned int zoom) {
@@ -123,23 +168,22 @@ void TileLoader::finishedRequest(QNetworkReply *reply) {
   const QNetworkRequest request = reply->request();
 
   //  find corresponding tile
-  MapTile *tile = 0;
-  for (MapTile &t : tiles_) {
-    if (t.reply() == reply) {
-      tile = &t;
-    }
-  }
-  if (!tile) {
+  const std::vector<MapTile>::iterator it =
+      std::find_if(tiles_.begin(), tiles_.end(),
+                   [&](const MapTile &tile) { return tile.reply() == reply; });
+  if (it == tiles_.end()) {
     //  removed from list already, ignore this reply
     return;
   }
+  MapTile &tile = *it;
 
   if (reply->error() == QNetworkReply::NoError) {
     //  decode an image
     QImageReader reader(reply);
     if (reader.canRead()) {
       QImage image = reader.read();
-      tile->setImage(image);
+      tile.setImage(image);
+      image.save(cachedPathForTile(tile.x(), tile.y(), tile.z()), "JPEG");
       emit receivedImage(request);
     } else {
       //  probably not an image
@@ -148,22 +192,22 @@ void TileLoader::finishedRequest(QNetworkReply *reply) {
       emit errorOcurred(err);
     }
   } else {
-    QString err;
-    err = "Failed loading " + request.url().toString();
-    err += " with code " + QString::number(reply->error());
+    const QString err = "Failed loading " + request.url().toString() +
+                        " with code " + QString::number(reply->error());
     emit errorOcurred(err);
   }
 
-  //  check if all tiles have images
-  bool loaded = true;
-  for (MapTile &tile : tiles_) {
-    if (!tile.hasImage()) {
-      loaded = false;
-    }
-  }
+  checkIfLoadingComplete();
+}
+
+bool TileLoader::checkIfLoadingComplete() {
+  const bool loaded =
+      std::all_of(tiles_.begin(), tiles_.end(),
+                  [](const MapTile &tile) { return tile.hasImage(); });
   if (loaded) {
     emit finishedLoading();
   }
+  return loaded;
 }
 
 QUrl TileLoader::uriForTile(int x, int y) const {
@@ -180,14 +224,20 @@ QUrl TileLoader::uriForTile(int x, int y) const {
   return QUrl(qstr);
 }
 
+QString TileLoader::cachedNameForTile(int x, int y, int z) const {
+  return "x" + QString::number(x) + "_y" + QString::number(y) + "_z" +
+         QString::number(z) + ".jpg";
+}
+
+QString TileLoader::cachedPathForTile(int x, int y, int z) const {
+  return QDir::cleanPath(cache_path_ + QDir::separator() +
+                         cachedNameForTile(x, y, z));
+}
+
 int TileLoader::maxTiles() const { return (1 << zoom_) - 1; }
 
 void TileLoader::abort() {
   tiles_.clear();
-
   //  destroy network access manager
-  if (qnam_) {
-    delete qnam_;
-    qnam_ = 0;
-  }
+  qnam_.reset();
 }

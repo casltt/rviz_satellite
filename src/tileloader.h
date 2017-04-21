@@ -17,24 +17,30 @@
 #include <QString>
 #include <QNetworkReply>
 #include <vector>
-#include <tuple>
+#include <memory>
 
 class TileLoader : public QObject {
   Q_OBJECT
 public:
   class MapTile {
   public:
-    MapTile(int x, int y, QNetworkReply *reply = 0)
-        : x_(x), y_(y), reply_(reply) {}
+    MapTile(int x, int y, int z, QNetworkReply *reply = 0)
+        : x_(x), y_(y), z_(z), reply_(reply) {}
+      
+    MapTile(int x, int y, int z, QImage & image)
+      : x_(x), y_(y), z_(z), image_(image) {}
 
     /// X tile coordinate.
-    const int &x() const { return x_; }
+    int x() const { return x_; }
 
     /// Y tile coordinate.
-    const int &y() const { return y_; }
+    int y() const { return y_; }
+      
+    /// Z tile zoom value.
+    int z() const { return z_; }
 
     /// Network reply.
-    QNetworkReply *reply() { return reply_; }
+    const QNetworkReply *reply() const { return reply_; }
 
     /// Abort the network request for this tile, if applicable.
     void abortLoading();
@@ -49,6 +55,7 @@ public:
   private:
     int x_;
     int y_;
+    int z_;
     QNetworkReply *reply_;
     QImage image_;
   };
@@ -64,16 +71,19 @@ public:
   double resolution() const;
 
   /// X index of central tile.
-  int tileX() const { return tile_x_; }
+  int centerTileX() const { return center_tile_x_; }
 
   /// Y index of central tile.
-  int tileY() const { return tile_y_; }
+  int centerTileY() const { return center_tile_y_; }
 
   /// Fraction of a tile to offset the origin (X).
-  double originX() const { return origin_x_; }
+  double originOffsetX() const { return origin_offset_x_; }
 
-  /// Fractio of a tile to offset the origin (Y).
-  double originY() const { return origin_y_; }
+  /// Fraction of a tile to offset the origin (Y).
+  double originOffsetY() const { return origin_offset_y_; }
+
+  /// Test if (lat,lon) falls inside centre tile.
+  bool insideCentreTile(double lat, double lon) const;
 
   /// Convert lat/lon to a tile index with mercator projection.
   static void latLonToTileCoords(double lat, double lon, unsigned int zoom,
@@ -109,8 +119,17 @@ private slots:
 
 private:
 
+  /// Check if loading is complete. Emit signal if appropriate.
+  bool checkIfLoadingComplete();
+
   /// URI for tile [x,y]
   QUrl uriForTile(int x, int y) const;
+
+  /// Get name for cached tile [x,y,z]
+  QString cachedNameForTile(int x, int y, int z) const;
+
+  /// Get file path for cached tile [x,y,z].
+  QString cachedPathForTile(int x, int y, int z) const;
 
   /// Maximum number of tiles for the zoom level
   int maxTiles() const;
@@ -119,12 +138,14 @@ private:
   double longitude_;
   unsigned int zoom_;
   int blocks_;
-  int tile_x_;
-  int tile_y_;
-  double origin_x_;
-  double origin_y_;
+  int center_tile_x_;
+  int center_tile_y_;
+  double origin_offset_x_;
+  double origin_offset_y_;
 
-  QNetworkAccessManager *qnam_;
+  std::shared_ptr<QNetworkAccessManager> qnam_;
+  QString cache_path_;
+
   std::string object_uri_;
 
   std::vector<MapTile> tiles_;

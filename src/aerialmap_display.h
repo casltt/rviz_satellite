@@ -11,15 +11,16 @@
 #ifndef AERIAL_MAP_DISPLAY_H
 #define AERIAL_MAP_DISPLAY_H
 
+// NOTE: workaround for issue: https://bugreports.qt.io/browse/QTBUG-22829
+#ifndef Q_MOC_RUN
 #include <ros/ros.h>
 #include <ros/time.h>
 #include <rviz/display.h>
+#include <sensor_msgs/NavSatFix.h>
 
 #include <OGRE/OgreTexture.h>
 #include <OGRE/OgreMaterial.h>
-#include <OGRE/OgreVector3.h>
-
-#include <sensor_msgs/NavSatFix.h>
+#endif  //  Q_MOC_RUN
 
 #include <QObject>
 #include <QtConcurrentRun>
@@ -28,6 +29,7 @@
 #include <QFile>
 #include <QNetworkRequest>
 
+#include <memory>
 #include <tileloader.h>
 
 namespace Ogre {
@@ -41,6 +43,8 @@ class IntProperty;
 class Property;
 class RosTopicProperty;
 class StringProperty;
+class TfFrameProperty;
+class EnumProperty;
 
 /**
  * @class AerialMapDisplay
@@ -59,12 +63,15 @@ public:
   virtual void update(float, float);
 
 protected Q_SLOTS:
+  void updateDynamicReload();
   void updateAlpha();
   void updateTopic();
+  void updateFrame();
   void updateDrawUnder();
   void updateObjectURI();
   void updateZoom();
   void updateBlocks();
+  void updateFrameConvention();
 
   //  slots for TileLoader messages
   void initiatedRequest(QNetworkRequest request);
@@ -103,33 +110,31 @@ protected:
   };
   std::vector<MapObject> objects_;
 
-  std::string topic_;
-  std::string frame_;
-
   ros::Subscriber coord_sub_;
 
   //  properties
   RosTopicProperty *topic_property_;
+  TfFrameProperty *frame_property_;
+  Property *dynamic_reload_property_;
   StringProperty *object_uri_property_;
   IntProperty *zoom_property_;
   IntProperty *blocks_property_;
   FloatProperty *resolution_property_;
   FloatProperty *alpha_property_;
   Property *draw_under_property_;
+  EnumProperty * frame_convention_property_;
 
   float alpha_;
   bool draw_under_;
   std::string object_uri_;
-  unsigned int zoom_;
-  unsigned int blocks_;
+  int zoom_;
+  int blocks_;
 
   //  tile management
-  boost::mutex mutex_;
   bool dirty_;
   bool received_msg_;
-  double ref_lat_;
-  double ref_lon_;
-  TileLoader *loader_;
+  sensor_msgs::NavSatFix ref_fix_;
+  std::shared_ptr<TileLoader> loader_;
 };
 
 } // namespace rviz
